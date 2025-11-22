@@ -1,0 +1,11 @@
+services:
+  - type: worker
+    name: funding-rates-worker
+    env: python
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    autoDeploy: true
+    envVars:
+      - key: DATABASE_URL
+        sync: false # you will set it via Render dashboard

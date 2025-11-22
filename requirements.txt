@@ -1,0 +1,5 @@
+pandas
+requests
+websockets
+psycopg2-binary
+python-dotenv
