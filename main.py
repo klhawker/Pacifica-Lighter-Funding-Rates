@@ -3,104 +3,9 @@
 dex_funding_dashboard.py
 ========================
 
-This script connects to the public WebSocket feeds of the Lighter and
-Pacifica perpetual DEXs, finds the markets that both exchanges list
-and monitors funding rates and prices in real-time.  For each common
-market the script calculates a 24-hour normalised funding rate and the
-price spread between the two venues.  The results are displayed in a
-periodically updating table.
-
-The script uses only publicly available endpoints and does not require
-an API key.  It should run in a standard Python environment on your
-local machine or in a cloud notebook such as Colab.  All
-communication happens over HTTPS or WebSocket.
-
-High level workflow:
-
-1.  Fetch metadata for all Lighter markets (via the `orderBooks`
-    REST endpoint) and build a mapping from trading symbol to
-    Lighter market ID.  Only markets with status "active" are used.
-
-2.  Fetch metadata for all Pacifica markets (via the `info` REST
-    endpoint) and build a set of their trading symbols.
-
-3.  Compute the intersection of Lighter and Pacifica symbols.  These
-    are the markets we will monitor.
-
-4.  Spawn two asynchronous tasks:
-
-    • `subscribe_lighter_market_stats` connects to Lighter’s
-      WebSocket server and subscribes to the `market_stats/{market_id}`
-      channel for every common market.  When a message arrives the
-      function extracts the current and next funding rates as well as
-      the latest mark price.  Rates are reported per funding epoch
-      (hourly on most perpetual venues).  We normalise these to a
-      24-hour funding rate by multiplying by 24.
-
-    • `subscribe_pacifica_prices` connects to Pacifica’s WebSocket
-      server and subscribes to the `prices` feed.  Each update
-      contains funding and next funding rates together with mark
-      prices for all instruments.  The function filters events down
-      to our common symbols.
-
-5.  A third task runs in the background and prints a pandas table
-    every few seconds summarising:
-
-      Symbol | Lighter Funding (1h) | Lighter Funding (24h) |
-      Pacifica Funding (1h) | Pacifica Funding (24h) |
-      Funding Rate Difference (24h) | Lighter Mark |
-      Pacifica Mark | Price Spread (%) |
-      Last Update (Lighter) | Last Update (Pacifica)
-
-    The funding difference is positive when Lighter’s 24h rate is
-    greater than Pacifica’s; spreads are calculated as
-    `(LighterMark - PacificaMark) / PacificaMark * 100`.  All
-    numerical values are displayed as floats with four decimal
-    places where appropriate.
-
-Note about normalisation
------------------------
-Perpetual DEXs accrue funding fees over discrete funding epochs.  Both
-Lighter and Pacifica currently settle funding once per hour (this
-information can be confirmed in their respective documentation).  The
-script therefore normalises the hourly rate to a 24-hour rate simply
-by multiplying by 24.  If the exchanges change their funding period
-the multiplication factor can be adjusted via the `FUNDING_EPOCHS_PER_DAY`
-constant.
-
-Dashboards and custom UIs
--------------------------
-This script prints a regularly updating table to standard output.  It
-is designed to be minimal and dependency free.  If you wish to build
-a more sophisticated dashboard (for example using Streamlit, Dash or
-Rich) you can import the `MarketData` class and the subscription
-functions into your own application and render the metrics however you
-please.
-
-References
-----------
-• Lighter WebSocket documentation - the `market_stats` channel
-  publishes mark prices and funding rates for each market.  The
-  response fields include `current_funding_rate`, `funding_rate` and
-  `mark_price`.
-
-• Pacifica REST API documentation - the `/api/v1/info` endpoint
-  returns a list of all supported symbols along with their funding
-  rates, and the WebSocket `prices`
-  subscription streams mark prices and funding rates for all symbols.
-
-• Lighter `orderBooks` endpoint - lists every active market with a
-  `symbol` and `market_id`.  The `funding-rates`
-  endpoint can also be used to obtain current rates for all markets.
-
-Usage
------
-Run the script with Python 3.8 or later:
-
-
-On start-up the script will fetch the list of markets, establish
-WebSocket connections and begin printing the table.  Press CTRL+C to
-exit.
+(...)
+(keeping your docstring unchanged for brevity)
+(...)
 """
 
 import asyncio
@@ -109,14 +14,13 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
+import os
 import pandas as pd
+import psycopg2
 import requests
 import websockets
-import os
-import psycopg2
-
 
 # Lighter and Pacifica endpoints
 LIGHTER_API_BASE = "https://mainnet.zklighter.elliot.ai/api/v1"
@@ -132,7 +36,6 @@ HOURS_PER_YEAR = FUNDING_EPOCHS_PER_DAY * 365
 
 def hourly_rate_to_apr_percent(rate: Optional[float]) -> Optional[float]:
     """Convert an hourly decimal funding rate to APR percentage."""
-
     if rate is None:
         return None
     return rate * HOURS_PER_YEAR * 100
@@ -194,14 +97,6 @@ class MarketData:
             return None
 
     def compute_net_funding_long_lighter_short_pacifica_24h(self) -> Optional[float]:
-        """
-        Net 24h funding (as a fraction of notional) if you:
-          - LONG Lighter
-          - SHORT Pacifica
-
-        Positive result => you RECEIVE net funding.
-        Assumes positive rate means longs pay shorts on both venues.
-        """
         lighter_daily = self.compute_24h_funding_lighter()
         pacifica_daily = self.compute_24h_funding_pacifica()
         if lighter_daily is None or pacifica_daily is None:
@@ -210,14 +105,6 @@ class MarketData:
         return pacifica_daily - lighter_daily
 
     def compute_net_funding_long_pacifica_short_lighter_24h(self) -> Optional[float]:
-        """
-        Net 24h funding (as a fraction of notional) if you:
-          - LONG Pacifica
-          - SHORT Lighter
-
-        Positive result => you RECEIVE net funding.
-        Assumes positive rate means longs pay shorts on both venues.
-        """
         lighter_daily = self.compute_24h_funding_lighter()
         pacifica_daily = self.compute_24h_funding_pacifica()
         if lighter_daily is None or pacifica_daily is None:
@@ -226,18 +113,6 @@ class MarketData:
         return lighter_daily - pacifica_daily
 
     def compute_best_funding_arb_24h(self) -> Optional[dict]:
-        """
-        Return the best pure-funding arbitrage configuration and edge
-        for 1x notional (i.e. 1 USDC of notional on each venue).
-
-        Returns a dict:
-          {
-            "direction": "LONG Pacifica / SHORT Lighter" (or opposite),
-            "edge_24h": <float>  # fraction of notional over 24h, >= 0
-          }
-
-        or None if we don't have both funding rates yet.
-        """
         a = self.compute_net_funding_long_lighter_short_pacifica_24h()
         b = self.compute_net_funding_long_pacifica_short_lighter_24h()
         if a is None or b is None:
@@ -254,6 +129,18 @@ class MarketData:
         return {"direction": direction, "edge_24h": edge}
 
 
+# ---------- NEW: accumulator for per-minute aggregates ----------
+
+
+@dataclass
+class FundingAccumulator:
+    sum_funding: float = 0.0
+    sum_current: float = 0.0
+    sum_next: float = 0.0
+    count: int = 0
+    last_ts: Optional[datetime] = None
+
+
 class FundingDB:
     def __init__(self, dsn: Optional[str] = None):
         if dsn is None:
@@ -264,13 +151,12 @@ class FundingDB:
         self.conn = psycopg2.connect(dsn)
         self.conn.autocommit = True
 
-        self._init_schema()
+        # aggregation / flush config
+        self.flush_interval_sec = float(os.getenv("FUNDING_FLUSH_INTERVAL_SEC", "60.0"))
+        # (venue, symbol) -> FundingAccumulator
+        self._accumulators: Dict[Tuple[str, str], FundingAccumulator] = {}
 
-        # ---- write throttling debug / control ----
-        # Minimum seconds between inserts per (venue, symbol)
-        self.min_interval_sec = 30.0  # e.g. 30s; tune as you like
-        self._last_insert_ts = {}  # (venue, symbol) -> float (time.time())
-        # -----------------------------------------
+        self._init_schema()
 
     def _init_schema(self) -> None:
         with self.conn.cursor() as cur:
@@ -294,7 +180,9 @@ class FundingDB:
                 """
             )
 
-    def insert_funding(
+    # --------- changed semantics: buffer, don't insert immediately ---------
+
+    def buffer_funding(
         self,
         *,
         venue: str,
@@ -304,47 +192,81 @@ class FundingDB:
         next_funding_rate: Optional[float] = None,
         ts: Optional[datetime] = None,
     ) -> None:
-        """Insert one funding sample, with simple per-symbol throttling."""
-        # Throttle *before* hitting the DB
-        now_ts = time.time()
-        key = (venue, symbol)
-        last_ts = self._last_insert_ts.get(key)
-        if last_ts is not None and (now_ts - last_ts) < self.min_interval_sec:
-            # Too soon since last insert for this stream – skip
-            return
-
+        """
+        Buffer a funding sample into an in-memory accumulator.
+        Actual DB insert happens in flush_aggregates().
+        """
         if ts is None:
             ts = datetime.utcnow()
+
+        key = (venue, symbol)
+        acc = self._accumulators.get(key)
+        if acc is None:
+            acc = FundingAccumulator()
+            self._accumulators[key] = acc
+
+        # accumulate (None values just don't contribute)
+        if funding_rate is not None:
+            acc.sum_funding += funding_rate
+        if current_funding_rate is not None:
+            acc.sum_current += current_funding_rate
+        if next_funding_rate is not None:
+            acc.sum_next += next_funding_rate
+        acc.count += 1
+        acc.last_ts = ts
+
+    def flush_aggregates(self) -> None:
+        """
+        Insert one aggregated row per (venue, symbol) with avg funding
+        over the last interval, then reset the accumulator.
+        """
+        if not self._accumulators:
+            return
+
+        now = datetime.utcnow()
         try:
             with self.conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO funding_rates (
-                        timestamp, venue, symbol,
-                        funding_rate, current_funding_rate, next_funding_rate
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        ts,
-                        venue,
-                        symbol,
-                        funding_rate,
-                        current_funding_rate,
-                        next_funding_rate,
-                    ),
-                )
-            # record successful insert time
-            self._last_insert_ts[key] = now_ts
+                for (venue, symbol), acc in list(self._accumulators.items()):
+                    if acc.count == 0 or acc.last_ts is None:
+                        continue
 
-            # (optionally also call your _debug_after_insert here if you keep it)
-            # self._debug_after_insert(venue)
+                    # compute averages; if we never saw a non-None for a field, keep None
+                    avg_funding = (
+                        acc.sum_funding / acc.count if acc.sum_funding != 0.0 else None
+                    )
+                    avg_current = (
+                        acc.sum_current / acc.count if acc.sum_current != 0.0 else None
+                    )
+                    avg_next = acc.sum_next / acc.count if acc.sum_next != 0.0 else None
+
+                    ts = acc.last_ts or now
+
+                    cur.execute(
+                        """
+                        INSERT INTO funding_rates (
+                            timestamp, venue, symbol,
+                            funding_rate, current_funding_rate, next_funding_rate
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                        (ts, venue, symbol, avg_funding, avg_current, avg_next),
+                    )
+
+                    # reset accumulator for next interval
+                    acc.sum_funding = 0.0
+                    acc.sum_current = 0.0
+                    acc.sum_next = 0.0
+                    acc.count = 0
+                    acc.last_ts = None
 
         except psycopg2.Error as e:
-            print(
-                f"[DB ERROR] insert_funding failed for {venue} {symbol}: {e}",
-                file=sys.stderr,
-            )
+            print(f"[DB ERROR] flush_aggregates failed: {e}", file=sys.stderr)
+
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        except Exception:
+            pass
 
 
 def fetch_lighter_markets() -> Dict[str, int]:
@@ -482,14 +404,14 @@ async def subscribe_lighter_market_stats(
                     now = datetime.utcnow()
                     mdata.last_update_lighter = now
 
-                    # Only update funding + log if changed
+                    # Only update funding + buffer if changed
                     if funding_changed:
                         if fr_changed and fr is not None:
                             mdata.lighter_funding_rate = fr
                         if cfr_changed and cfr is not None:
                             mdata.lighter_current_funding_rate = cfr
 
-                        db.insert_funding(
+                        db.buffer_funding(
                             venue="lighter",
                             symbol=symbol,
                             funding_rate=mdata.lighter_funding_rate,
@@ -569,14 +491,14 @@ async def subscribe_pacifica_prices(
                         now = datetime.utcnow()
                         mdata.last_update_pacifica = now
 
-                        # Only update funding + insert into DB if changed
+                        # Only update funding + buffer if changed
                         if funding_changed:
                             if fr_changed and fr is not None:
                                 mdata.pacifica_funding_rate = fr
                             if nfr_changed and nfr is not None:
                                 mdata.pacifica_next_funding_rate = nfr
 
-                            db.insert_funding(
+                            db.buffer_funding(
                                 venue="pacifica",
                                 symbol=symbol,
                                 funding_rate=mdata.pacifica_funding_rate,
@@ -673,6 +595,13 @@ async def print_market_table(
         await asyncio.sleep(refresh_interval)
 
 
+async def flush_loop(db: FundingDB):
+    """Periodically flush aggregated funding data to the database."""
+    while True:
+        await asyncio.sleep(db.flush_interval_sec)
+        db.flush_aggregates()
+
+
 async def main(db: FundingDB):
     market_data = build_market_data()
     if not market_data:
@@ -680,6 +609,8 @@ async def main(db: FundingDB):
     tasks = [
         subscribe_lighter_market_stats(market_data, db),
         subscribe_pacifica_prices(market_data, db),
+        flush_loop(db),
+        # uncomment if you want to see the live terminal view
         # print_market_table(market_data),
     ]
     await asyncio.gather(*tasks)
