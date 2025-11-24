@@ -258,34 +258,41 @@ class FundingDB:
     def __init__(self, dsn: Optional[str] = None):
         if dsn is None:
             dsn = os.environ.get("DATABASE_URL")
-            print(dsn)
             if not dsn:
                 raise RuntimeError("DATABASE_URL env var is not set")
 
         self.conn = psycopg2.connect(dsn)
-
-        # 🔹 IMPORTANT: commit every statement automatically
         self.conn.autocommit = True
 
         self._init_schema()
 
+        # ---- write throttling debug / control ----
+        # Minimum seconds between inserts per (venue, symbol)
+        self.min_interval_sec = 30.0  # e.g. 30s; tune as you like
+        self._last_insert_ts = {}  # (venue, symbol) -> float (time.time())
+        # -----------------------------------------
+
     def _init_schema(self) -> None:
-        """Create the funding_rates table if it does not exist."""
         with self.conn.cursor() as cur:
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS funding_rates (
                     id BIGSERIAL PRIMARY KEY,
                     timestamp TIMESTAMPTZ NOT NULL,
-                    venue TEXT NOT NULL,              -- 'lighter' or 'pacifica'
+                    venue TEXT NOT NULL,
                     symbol TEXT NOT NULL,
-                    funding_rate DOUBLE PRECISION,    -- 1h funding (decimal)
-                    current_funding_rate DOUBLE PRECISION, -- Lighter-specific
-                    next_funding_rate DOUBLE PRECISION     -- Pacifica-specific
+                    funding_rate DOUBLE PRECISION,
+                    current_funding_rate DOUBLE PRECISION,
+                    next_funding_rate DOUBLE PRECISION
                 );
                 """
             )
-        # no explicit commit needed because autocommit=True
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_funding_rates_symbol_ts
+                ON funding_rates (symbol, timestamp);
+                """
+            )
 
     def insert_funding(
         self,
@@ -297,28 +304,47 @@ class FundingDB:
         next_funding_rate: Optional[float] = None,
         ts: Optional[datetime] = None,
     ) -> None:
-        """Insert one funding sample."""
+        """Insert one funding sample, with simple per-symbol throttling."""
+        # Throttle *before* hitting the DB
+        now_ts = time.time()
+        key = (venue, symbol)
+        last_ts = self._last_insert_ts.get(key)
+        if last_ts is not None and (now_ts - last_ts) < self.min_interval_sec:
+            # Too soon since last insert for this stream – skip
+            return
+
         if ts is None:
             ts = datetime.utcnow()
-        with self.conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO funding_rates (
-                    timestamp, venue, symbol,
-                    funding_rate, current_funding_rate, next_funding_rate
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO funding_rates (
+                        timestamp, venue, symbol,
+                        funding_rate, current_funding_rate, next_funding_rate
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        ts,
+                        venue,
+                        symbol,
+                        funding_rate,
+                        current_funding_rate,
+                        next_funding_rate,
+                    ),
                 )
-                VALUES (%s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    ts,
-                    venue,
-                    symbol,
-                    funding_rate,
-                    current_funding_rate,
-                    next_funding_rate,
-                ),
+            # record successful insert time
+            self._last_insert_ts[key] = now_ts
+
+            # (optionally also call your _debug_after_insert here if you keep it)
+            # self._debug_after_insert(venue)
+
+        except psycopg2.Error as e:
+            print(
+                f"[DB ERROR] insert_funding failed for {venue} {symbol}: {e}",
+                file=sys.stderr,
             )
-        # again, no explicit commit needed
 
 
 def fetch_lighter_markets() -> Dict[str, int]:
@@ -654,7 +680,7 @@ async def main(db: FundingDB):
     tasks = [
         subscribe_lighter_market_stats(market_data, db),
         subscribe_pacifica_prices(market_data, db),
-        print_market_table(market_data),
+        # print_market_table(market_data),
     ]
     await asyncio.gather(*tasks)
 
